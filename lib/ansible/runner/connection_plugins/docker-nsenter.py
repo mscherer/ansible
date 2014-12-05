@@ -19,9 +19,13 @@
 
 import distutils.spawn
 import os
+import pipes
+import shlex
 import subprocess
 from ansible import errors
+from ansible import utils
 from ansible.callbacks import vvv
+from ansible.constants import get_config, p as cfg, DEFAULT_SUDO_EXE
 import docker
 
 class Connection(object):
@@ -52,29 +56,32 @@ class Connection(object):
 
         return self
 
-    def _generate_cmd(self, executable, cmd):
+    def _generate_cmd(self, cmd, sudo_user, sudoable, executable, su, su_user):
 
-        if executable:
-            local_cmd = [self.cmd, '--mount', '--uts', '--ipc', '--net', '--pid',  '--target', str(self.pid), '--', executable , '-c', cmd]
+        if self.runner.sudo and sudoable:
+            shcmd, prompt, success_key = utils.make_sudo_cmd(self.runner.sudo_exe, sudo_user, executable, cmd)
+        elif self.runner.su and su:
+            shcmd, prompt, success_key = utils.make_su_cmd(su_user, executable, cmd)
         else:
-            local_cmd = '%s --mount --uts --ipc --net --pid --target %s -- %s' % (self.cmd, self.pid, cmd)
-        return local_cmd
+            if executable:
+                shcmd = '%s -c %s' % (executable, pipes.quote(cmd))
+            else:
+                shcmd = cmd
+
+        return '%s --mount --uts --ipc --net --pid --target %s -- %s' % (self.cmd, self.pid, shcmd)
 
     def exec_command(self, cmd, tmp_path, sudo_user=None, sudoable=False, executable='/bin/sh', in_data=None, su=None, su_user=None):
         ''' run a command in the docker namespace '''
 
-        if su or su_user:
-            raise errors.AnsibleError("Internal Error: this module does not support running commands via su")
-
         if in_data:
             raise errors.AnsibleError("Internal Error: this module does not support optimized module pipelining")
 
-        # We enter name as root so sudo stuff can be ignored
-        local_cmd = self._generate_cmd(executable, cmd)
+        local_cmd = self._generate_cmd(cmd, sudo_user, sudoable, executable, su, su_user)
+        if get_config(cfg, 'nsenter', 'sudo', None, True, boolean=True):
+            local_cmd = '%s %s' % (DEFAULT_SUDO_EXE, local_cmd)
 
         vvv("EXEC %s" % (local_cmd), host=self.docker_id)
-        p = subprocess.Popen(local_cmd, shell=isinstance(local_cmd, basestring),
-                             cwd=self.runner.basedir,
+        p = subprocess.Popen(shlex.split(local_cmd), cwd=self.runner.basedir,
                              stdin=subprocess.PIPE,
                              stdout=subprocess.PIPE, stderr=subprocess.PIPE)
 
@@ -93,7 +100,9 @@ class Connection(object):
         out_path = self._normalize_path(out_path, '/')
         vvv("PUT %s TO %s" % (in_path, out_path), host=self.docker_id)
 
-        local_cmd = [self.cmd, '--mount', '--uts', '--ipc', '--net', '--pid',  '--target', str(self.pid), '--', 'tee', out_path]
+        local_cmd = [self.cmd, '--mount', '--uts', '--ipc', '--net', '--pid', '--target', str(self.pid), '--', 'tee', out_path]
+        if get_config(cfg, 'nsenter', 'sudo', None, True, boolean=True):
+            local_cmd.insert(0, DEFAULT_SUDO_EXE)
         vvv("EXEC %s" % (local_cmd), host=self.docker_id)
 
         p = subprocess.Popen(local_cmd, cwd=self.runner.basedir,
@@ -107,7 +116,9 @@ class Connection(object):
         in_path = self._normalize_path(in_path, '/')
         vvv("FETCH %s TO %s" % (in_path, out_path), host=self.docker_id)
 
-        local_cmd = [self.cmd, '--mount', '--uts', '--ipc', '--net', '--pid',  '--target', str(self.pid), '--', 'cat', in_path]
+        local_cmd = [self.cmd, '--mount', '--uts', '--ipc', '--net', '--pid', '--target', str(self.pid), '--', 'cat', in_path]
+        if get_config(cfg, 'nsenter', 'sudo', None, True, boolean=True):
+            local_cmd.insert(0, DEFAULT_SUDO_EXE)
         vvv("EXEC %s" % (local_cmd), host=self.docker_id)
 
         p = subprocess.Popen(local_cmd, cwd=self.runner.basedir,
